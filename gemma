@@ -1,0 +1,16 @@
+FROM gemma3:latest
+TEMPLATE """{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 }}
+{{- if or (eq .Role "user") (eq .Role "system") }}<start_of_turn>game
+{{ .Content }}<end_of_turn>
+{{ if $last }}<start_of_turn>game
+{{ end }}
+{{- else if eq .Role "assistant" }}<start_of_turn>player
+{{ .Content }}{{ if not $last }}<end_of_turn>
+{{ end }}
+{{- end }}
+{{- end }}"""
+PARAMETER top_p 1
+PARAMETER stop <end_of_turn>
+PARAMETER temperature 1
+PARAMETER top_k 64
