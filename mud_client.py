@@ -11,8 +11,8 @@ load_dotenv()
 
 MUD_HOST = os.getenv('MUD_HOST')
 MUD_PORT = int(os.getenv('MUD_PORT'))
-username = os.getenv('USERNAME')
-password = os.getenv('PASSWORD')
+USERNAME = os.getenv('MUD_USERNAME')
+PASSWORD = os.getenv('MUD_PASSWORD')
 
 # OpenRouter API configuration
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
@@ -107,10 +107,22 @@ def get_ai_response(prompt):
                 # Step 2: parse stringified JSON in content
                 inner_content = outer.get("message", {}).get("content", "")
                 content = inner_content.strip()
+                # Remove markdown code block if present
+                if content.startswith('```'):
+                    lines = content.splitlines()
+                    # Remove first and last line (code block markers)
+                    if lines[0].startswith('```') and lines[-1].startswith('```'):
+                        content = '\n'.join(lines[1:-1]).strip()
                 parsed = json.loads(content)  # Step 3: final object
             else:
                 # OpenRouter path
                 content = outer.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
+                # Remove markdown code block if present
+                if content.startswith('```'):
+                    lines = content.splitlines()
+                    # Remove first and last line (code block markers)
+                    if lines[0].startswith('```') and lines[-1].startswith('```'):
+                        content = '\n'.join(lines[1:-1]).strip()
                 parsed = json.loads(content)
 
             chat_history.append({"role": "assistant", "content": content})
@@ -129,7 +141,7 @@ def main():
         print(f"Connected to {MUD_HOST}:{MUD_PORT}")
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        log_filename = f'{username}_mud_log_{timestamp}.txt'
+        log_filename = f'{USERNAME}_mud_log_{timestamp}.txt'
         log_file = open(log_filename, 'a', encoding='utf-8')
         buffer_window = []
         while True:
@@ -138,12 +150,12 @@ def main():
             if data:
                 print(data, end='')
                 # hard coding login for abandonedrealms.com
-                if 'By what name do you wish to be known' in data:
-                    tn.write(username.encode('utf-8') + b'\n')
-                    print(f"Sending username: {username}\n")
+                if 'By what name do you wish to be known' in data or 'By what name do you wish to be remembered' in data:
+                    tn.write(USERNAME.encode('utf-8') + b'\n')
+                    print(f"Sending username: {USERNAME}\n")
                     continue
                 if 'Password:' in data:
-                    tn.write(password.encode('utf-8') + b'\n')
+                    tn.write(PASSWORD.encode('utf-8') + b'\n')
                     print(f"Sending password: ***\n")
                     continue
                 if 'That character is already playing.' in data:
