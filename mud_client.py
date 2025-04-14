@@ -122,12 +122,15 @@ def get_ai_response(prompt):
 
 def main():
     global last_stats_check, waiting_for_stats
-    tn = telnetlib.Telnet(MUD_HOST, MUD_PORT)
-    print(f"Connected to {MUD_HOST}:{MUD_PORT}")
+    tn = None
+    log_file = None
+    try:
+        tn = telnetlib.Telnet(MUD_HOST, MUD_PORT)
+        print(f"Connected to {MUD_HOST}:{MUD_PORT}")
 
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    log_filename = f'mud_log_{timestamp}.txt'
-    with open(log_filename, 'a', encoding='utf-8') as log_file:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        log_filename = f'{username}_mud_log_{timestamp}.txt'
+        log_file = open(log_filename, 'a', encoding='utf-8')
         buffer_window = []
         while True:
             data = tn.read_very_eager().decode('utf-8', errors='ignore')
@@ -181,6 +184,21 @@ def main():
                     # Always send at least a newline to avoid hanging
                     tn.write(((game_input if game_input else '') + '\n').encode('utf-8'))
             time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nGraceful shutdown requested. Closing connections...")
+    finally:
+        if tn:
+            try:
+                tn.close()
+                print("Telnet connection closed.")
+            except Exception:
+                pass
+        if log_file:
+            try:
+                log_file.close()
+                print("Log file closed.")
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()
