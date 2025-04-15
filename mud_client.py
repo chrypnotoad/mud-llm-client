@@ -32,7 +32,7 @@ Objects:	appraise bait barter bid brandish buy cancel close collect combine drin
 Communication:	application apply commend complaint deaf emote esay esays gossip greet gtell honor ignore order pmote pose pray quiet replay reply report say socials tell yell
 Information	affects applicants areas changes commands compare consider credits equipment event examine help helpsearch history idea info inventory issues look news note oversee powers preview proficiency read score score2 show skills songs spells time timeconvert typo wealth weather whios who whois wizlist worth x \n
 Combat:	cast channel chant commune confinement ecast flee focus kill murder sing \n
-Misc:A	addquest allow bet bug check delete demote dice enlist gain gamble gift grip group hammer heal induct outfit pardon pay pet practice promote puke questor questor2 quit raise refuse rehearse release save surrender task train uninduct
+Misc:	addquest allow bet bug check delete demote dice enlist gain gamble gift grip group hammer heal induct outfit pardon pay pet practice promote puke questor questor2 quit raise refuse rehearse release save surrender task train uninduct
 </commands>"""
 system_prompt = base_system_prompt + "\n\n" + score + "\n\n" + look
 
@@ -172,6 +172,11 @@ def get_ai_response(prompt):
             print("JSON decode error:", e)
             raise
 
+def send_command_and_get_response(tn, command):
+    tn.write(command.encode('utf-8') + b'\n')
+    response = tn.read_until(b'> ', timeout=5)
+    return response.decode('utf-8', errors='ignore')
+
 def main():
     global last_stats_check, waiting_for_stats
     tn = None
@@ -183,6 +188,21 @@ def main():
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         log_filename = f'{USERNAME}_mud_log_{timestamp}.txt'
         log_file = open(log_filename, 'a', encoding='utf-8')
+
+        # Log non-secret environment variables at the top of the log file
+        env_vars_to_log = {
+            'MUD_HOST': MUD_HOST,
+            'MUD_PORT': MUD_PORT,
+            'USERNAME': USERNAME,
+            'OPENROUTER_MODEL': OPENROUTER_MODEL,
+            'PROVIDER': PROVIDER
+        }
+        log_file.write("# Environment variables (non-secret):\n")
+        for k, v in env_vars_to_log.items():
+            log_file.write(f"{k}={v}\n")
+        log_file.write("\n")
+        log_file.flush()
+
         buffer_window = []
         while True:
             data = tn.read_very_eager().decode('utf-8', errors='ignore')
@@ -202,16 +222,12 @@ def main():
                     tn.write(b'y\n')
                     continue
                 # get score
-                tn.write(b'score\n')
-                time.sleep(1)
                 global score
-                score = tn.read_very_eager().decode('utf-8', errors='ignore')
+                score = send_command_and_get_response(tn, 'score')
                 
-                tn.write(b'look\n')
-                time.sleep(1)
                 #get look
                 global look
-                look = tn.read_very_eager().decode('utf-8', errors='ignore')
+                look = send_command_and_get_response(tn, 'look')
                 update_system_prompt(base_system_prompt, score, look)
 
                 log_file.write(data)
