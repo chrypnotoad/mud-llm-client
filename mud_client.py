@@ -19,7 +19,7 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 OPENROUTER_API_URL = os.getenv('OPENROUTER_API_URL')
 OLLAMA_API_URL = os.getenv('OLLAMA_API_URL')
 OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL')
-PROVIDER = 'openrouter'
+PROVIDER = os.getenv('PROVIDER')
 
 chat_history = []
 score = ''
@@ -49,6 +49,9 @@ def get_ai_response(prompt):
     # Append user message
     chat_history.append({"role": "system", "content": prompt})
 
+    max_retries = 5
+    backoff = 2
+    retries = 0
     while True:
         payload = {
             "messages": chat_history
@@ -65,11 +68,14 @@ def get_ai_response(prompt):
             headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
         elif PROVIDER == 'ollama':
             # Ollama API request
-            payload["model"] = "llama3.1"
+            payload["model"] = "gemma3"
             payload['format'] = {
                 "type": "object",
                 "properties": {
                     "reasoning": {
+                        "type": "string"
+                    },
+                    "decision": {
                         "type": "string"
                     },
                     "game_input": {
@@ -77,8 +83,9 @@ def get_ai_response(prompt):
                     }
                 },
                 "required": [
-                    "thinking",
-                    "input"
+                    "reasoning",
+                    "decision",
+                    "game_input"
                 ]
             }
             payload['options'] = {
@@ -95,6 +102,39 @@ def get_ai_response(prompt):
         response.raise_for_status()
 
         response_text = response.text.strip()
+
+        # Try to parse as JSON and check for 429/quota error
+        is_quota_error = False
+        try:
+            resp_json = json.loads(response_text)
+            if 'error' in resp_json:
+                err = resp_json['error']
+                code = err.get('code')
+                status = err.get('status', '')
+                if code == 429 or status == 'RESOURCE_EXHAUSTED':
+                    is_quota_error = True
+                # Some providers (like Google) may wrap the real error in metadata['raw']
+                if 'metadata' in err and 'raw' in err['metadata']:
+                    try:
+                        raw_err = json.loads(err['metadata']['raw'])
+                        raw_code = raw_err.get('error', {}).get('code')
+                        raw_status = raw_err.get('error', {}).get('status', '')
+                        if raw_code == 429 or raw_status == 'RESOURCE_EXHAUSTED':
+                            is_quota_error = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if is_quota_error:
+            if retries < max_retries:
+                print(f"[ERROR] Quota exceeded or rate limited (429). Retrying in {backoff} seconds...")
+                time.sleep(backoff)
+                retries += 1
+                backoff *= 2
+                continue
+            else:
+                print("[ERROR] Maximum retries reached. Please check your API quota or try again later.")
+                return None
 
         try:
             match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -183,6 +223,10 @@ def main():
                 context = ''.join(buffer_window)
                 if '\n' in data:
                     parsed = get_ai_response(context)
+                    if parsed is None:
+                        print("[INFO] AI response unavailable due to quota/rate limit. Press Enter to retry or Ctrl+C to exit.")
+                        input()
+                        continue
                     reasoning = parsed.get('reasoning', '')
                     decision = parsed.get('decision', '')
                     game_input = parsed.get('game_input', '')
