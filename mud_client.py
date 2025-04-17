@@ -9,6 +9,18 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+# Load current goal from journal
+JOURNAL_PATH = 'mud_journal.json'
+def load_current_goal():
+    try:
+        with open(JOURNAL_PATH, 'r', encoding='utf-8') as jf:
+            journal = json.load(jf)
+            return journal.get('goal', '')
+    except Exception:
+        return ''
+
+current_goal = load_current_goal()
+
 MUD_HOST = os.getenv('MUD_HOST')
 MUD_PORT = int(os.getenv('MUD_PORT'))
 USERNAME = os.getenv('MUD_USERNAME')
@@ -25,29 +37,41 @@ chat_history = []
 score = ''
 look = ''
 base_system_prompt = """You are playing a live online MUD game. Respond ONLY with a JSON object containing 3 fields: 'reasoning' (your reasoning) and 'decision' (your conclusion about your next action) 'game_input' (the command to send). You are an EXPERT MUD player.\n\n
-    <commands>
-    Movement:	align enter exits follow go map meditate minimap mm recall rest scan sit sleep solitude stand tag visible wake walk where area \n
-Config:	alias autoassist autocomplete autodef autoexit autogold autogrammar autogrip autohint autolist autoloot autopeace autosac autosplit background brief channels color compact description donate nofollow nomagic nosummon noyel noyell password prompt remove scroll sell submit target unlock untarget wimpy \n
-Objects:	appraise bait barter bid brandish buy cancel close collect combine drink drop eat feed fill get give hire hold list lock market open pitch possession pour pull put quaff recite reel reload reshape retire retrieve return sacrifice take unpitch value wear wield zap \n
-Communication:	application apply commend complaint deaf emote esay esays gossip greet gtell honor ignore order pmote pose pray quiet replay reply report say socials tell yell
-Information	affects applicants areas changes commands compare consider credits equipment event examine help helpsearch history idea info inventory issues look news note oversee powers preview proficiency read score score2 show skills songs spells time timeconvert typo wealth weather whios who whois wizlist worth x \n
-Combat:	cast channel chant commune confinement ecast flee focus kill murder sing \n
-Misc:	addquest allow bet bug check delete demote dice enlist gain gamble gift grip group hammer heal induct outfit pardon pay pet practice promote puke questor questor2 quit raise refuse rehearse release save surrender task train uninduct
-</commands>"""
-system_prompt = base_system_prompt + "\n\n" + score + "\n\n" + look
-
-def update_system_prompt(base, score, look):
-    global system_prompt
-    system_prompt = base + "\n\n" + score + "\n\n" + look
+<commands>
+List of commands:
+Movement:	align, enter, exits, follow, go, map, meditate, minimap, mm, recall, rest, scan, sit, sleep, solitude, stand, tag, visible, wake, walk, where, area, \n
+Config:	alias, autoassist, autocomplete, autodef, autoexit, autogold, autogrammar, autogrip, autohint, autolist, autoloot, autopeace, autosac, autosplit, background, brief, channels, color, compact, description, donate, nofollow, nomagic, nosummon, noyel, noyell, password, prompt, remove, scroll, sell, submit, target, unlock, untarget, wimpy \n
+Objects:    appraise, bait, barter, bid, brandish, buy, cancel, close, collect, combine, drink, drop, eat, feed, fill, get, give, hire, hold, list, lock, market, open, pitch, possession, pour, pull, put, quaff, recite, reel, reload, reshape, retire, retrieve, return, sacrifice, take, unpitch, value, wear, wield, zap, \n
+Communication:	application, apply, commend, complaint, deaf, emote, esay, esays, gossip, greet, gtell, honor, ignore, order, pmote, pose, pray, quiet, replay, reply, report, say, socials, tell, yell
+Information	affects, applicants, areas, changes, commands, compare, consider, credits, equipment, event, examine, help, helpsearch, history, idea, info, inventory, issues, look, news, note, oversee, powers, preview, proficiency, read, score, score2, show, skills, songs, spells, time, timeconvert, typo, wealth, weather, whios, who, whois, wizlist, worth, x \n
+Combat:	cast, channel, chant, commune, confinement, ecast, flee, focus, kill, murder, sing \n
+Misc:	addquest, allow, bet, bug, check, delete, demote, dice, enlist, gain, gamble, gift, grip, group, hammer, heal, induct, outfit, pardon, pay, pet, practice, promote, puke, questor, questor2, quit, raise, refuse, rehearse, release, save, surrender, task, train, uninduct
+</commands>\n
+<tip>
+you can send multiple commands at the same time by separating them each with a pipe | 
+</tip>
+"""
+system_prompt = base_system_prompt + "\n\n" + f'<goal>:\n{current_goal}\n</goal>'
 
 def get_ai_response(prompt):
     # Insert or update system prompt at the top
-    if not chat_history or chat_history[0].get('content') != system_prompt:
+    if not chat_history or chat_history[0].get('role') != "system":
         chat_history.insert(0, {"role": "system", "content": system_prompt})
     else:
         chat_history[0]["content"] = system_prompt
     # Append user message
-    chat_history.append({"role": "system", "content": prompt})
+    chat_history.append({"role": "user", "content": prompt})
+
+    # Write prompt/context to ai_state.json for web UI
+    try:
+        with open("ai_state.json", "w", encoding="utf-8") as f:
+            json.dump({
+                "prompt": prompt,
+                "chat_history": chat_history,
+                "ai_response": None
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] Could not write ai_state.json: {e}")
 
     max_retries = 5
     backoff = 2
@@ -166,6 +190,16 @@ def get_ai_response(prompt):
                 parsed = json.loads(content)
 
             chat_history.append({"role": "assistant", "content": content})
+            # Write AI response to ai_state.json for web UI
+            try:
+                with open("ai_state.json", "w", encoding="utf-8") as f:
+                    json.dump({
+                        "prompt": prompt,
+                        "chat_history": chat_history,
+                        "ai_response": parsed
+                    }, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"[WARN] Could not write ai_state.json: {e}")
             return parsed  # Already parsed dict
 
         except json.JSONDecodeError as e:
@@ -174,7 +208,7 @@ def get_ai_response(prompt):
 
 def send_command_and_get_response(tn, command):
     tn.write(command.encode('utf-8') + b'\n')
-    response = tn.read_until(b'> ', timeout=5)
+    response = tn.read_until(b'>> ', timeout=5)
     return response.decode('utf-8', errors='ignore')
 
 def main():
@@ -204,8 +238,21 @@ def main():
         log_file.flush()
 
         buffer_window = []
+        logged_in = False  # Add this flag
+        one_time_score_sent = False
         while True:
+            # Send 'score' once after login when first prompt appears
+            if not logged_in and not one_time_score_sent:
+                tn.write(b'score\n')
+                one_time_score_sent = True
+                time.sleep(1)  # Wait for a moment to let the score be processed
             data = tn.read_very_eager().decode('utf-8', errors='ignore')
+            # data = tn.read_until(b'> ', timeout=5).decode('utf-8', errors='ignore')
+            
+            # Auto-continue if prompt is present
+            if '[Hit Return to continue]' in data:
+                tn.write(b'\n')
+                continue
             
             if data:
                 print(data, end='')
@@ -217,27 +264,20 @@ def main():
                 if 'Password:' in data:
                     tn.write(PASSWORD.encode('utf-8') + b'\n')
                     print(f"Sending password: ***\n")
+                    logged_in = True
                     continue
-                if 'That character is already playing.' in data:
-                    tn.write(b'y\n')
-                    continue
-                # get score
-                global score
-                score = send_command_and_get_response(tn, 'score')
+                # if 'That character is already playing.' in data:
+                #     tn.write(b'y\n')
+                #     continue
                 
-                #get look
-                global look
-                look = send_command_and_get_response(tn, 'look')
-                update_system_prompt(base_system_prompt, score, look)
 
                 log_file.write(data)
                 log_file.flush()       
                 buffer_window.append(data)
                 if len(buffer_window) > 1:
                     buffer_window.pop(0)
-                    
                 context = ''.join(buffer_window)
-                if '\n' in data:
+                if '>>' in data:
                     parsed = get_ai_response(context)
                     if parsed is None:
                         print("[INFO] AI response unavailable due to quota/rate limit. Press Enter to retry or Ctrl+C to exit.")
@@ -246,19 +286,27 @@ def main():
                     reasoning = parsed.get('reasoning', '')
                     decision = parsed.get('decision', '')
                     game_input = parsed.get('game_input', '')
-                    print(f"\n\033[35m[AI reasoning]: {reasoning}\033[0m")  
-                    print(f"\033[32m[AI decision]: {decision}\033[0m")     
-                    print(f"\033[36m[AI input]: {game_input}\033[0m")      
+                    print(f"\n\033[35m[AI reasoning]: {reasoning}\033[0m")
+                    print(f"\033[32m[AI decision]: {decision}\033[0m")
+                    print(f"\033[36m[AI input]: {game_input}\033[0m")
                     log_file.write(f"AI reasoning: {reasoning}\n")
-                    
                     log_file.write(f"AI input: {game_input}\n")
                     log_file.flush()
-                    # Always send at least a newline to avoid hanging
                     tn.write(((game_input if game_input else '') + '\n').encode('utf-8'))
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nGraceful shutdown requested. Closing connections...")
     finally:
+        # On shutdown, try to send 'score' and log the output
+        if tn and log_file:
+            try:
+                tn.write(b'score\n')
+                score_output = tn.read_until(b'> ', timeout=5).decode('utf-8', errors='ignore')
+                log_file.write(score_output)
+                log_file.flush()
+                print("[Shutdown] Sent 'score' and logged output.")
+            except Exception as e:
+                print(f"[Shutdown] Failed to send 'score' or log output: {e}")
         if tn:
             try:
                 tn.close()
