@@ -1,42 +1,84 @@
-import telnetlib 
+import telnetlib
 import requests
 import time
 import json
 import os
 import re
 from dotenv import load_dotenv
+from pymongo import MongoClient
 
-# Load environment variables from .env file
+# ------------------ ENV & MONGO SETUP ------------------
 load_dotenv()
 
-# Load current goal from journal
-JOURNAL_PATH = 'mud_journal.json'
+MONGO_URI = os.getenv('MONGO_URI', 'mongodb://localhost:27017')
+DB_NAME = os.getenv('MUD_DB_NAME', 'mud_llm')
+COLL_NAME = os.getenv('MUD_HISTORY_COLL', 'chat_history')
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+coll = db[COLL_NAME]
+
+USERNAME = os.getenv('MUD_USERNAME')
+PASSWORD = os.getenv('MUD_PASSWORD')
+MUD_HOST = os.getenv('MUD_HOST')
+MUD_PORT = int(os.getenv('MUD_PORT'))
+OLLAMA_API_URL = os.getenv('OLLAMA_API_URL', 'http://localhost:11434/v1/chat')
+SESSION_ID = USERNAME  # You can make this smarter: f"{USERNAME}_{date}" for multi-session
+
+JOURNAL_PATH = 'mud_journal.jsonl'
+NUM_MEMORIES = 5  # Number of recent journal entries to inject
+
+# --------------- JOURNAL UTILITIES ---------------
+def append_journal_entry(journal_text, extra_fields=None):
+    entry = {
+        "timestamp": time.time(),
+        "journal": journal_text
+    }
+    if extra_fields:
+        entry.update(extra_fields)
+    with open(JOURNAL_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+def get_recent_journal_entries(n=NUM_MEMORIES):
+    if not os.path.exists(JOURNAL_PATH):
+        return []
+    try:
+        with open(JOURNAL_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+        return [json.loads(line)["journal"] for line in lines if line.strip()]
+    except Exception:
+        return []
+
 def load_current_goal():
     try:
-        with open(JOURNAL_PATH, 'r', encoding='utf-8') as jf:
+        with open('mud_journal.json', 'r', encoding='utf-8') as jf:
             journal = json.load(jf)
             return journal.get('goal', '')
     except Exception:
         return ''
 
-current_goal = load_current_goal()
+# --------------- MONGO CHAT HISTORY UTILITIES ---------------
+def save_message_to_db(message, session_id=SESSION_ID):
+    coll.insert_one({
+        "session_id": session_id,
+        "timestamp": time.time(),
+        "message": message
+    })
 
-MUD_HOST = os.getenv('MUD_HOST')
-MUD_PORT = int(os.getenv('MUD_PORT'))
-USERNAME = os.getenv('MUD_USERNAME')
-PASSWORD = os.getenv('MUD_PASSWORD')
+def load_chat_history_from_db(session_id=SESSION_ID):
+    msgs = list(coll.find({"session_id": session_id}).sort("timestamp", 1))
+    return [m['message'] for m in msgs]
 
-# OpenRouter API configuration
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
-OPENROUTER_API_URL = os.getenv('OPENROUTER_API_URL')
-OLLAMA_API_URL = os.getenv('OLLAMA_API_URL')
-OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL')
-PROVIDER = os.getenv('PROVIDER')
+# --------------- PROMPT & LLM ---------------
+base_system_prompt = """You are playing a live online MUD game. Respond ONLY with a JSON object containing **four fields**:
+- 'journal': keep a running journal of what you are doing in game to help you remember,
+- 'reasoning': your reasoning,
+- 'decision': your conclusion about your next action,
+- 'game_input': the command to send,
 
-chat_history = []
-score = ''
-look = ''
-base_system_prompt = """You are playing a live online MUD game. Respond ONLY with a JSON object containing 3 fields: 'reasoning' (your reasoning) and 'decision' (your conclusion about your next action) 'game_input' (the command to send). You are an EXPERT MUD player.\n\n
+
+You are an EXPERT MUD player.
+
 <commands>
 List of commands:
 Movement:	align, enter, exits, follow, go, map, meditate, minimap, mm, recall, rest, scan, sit, sleep, solitude, stand, tag, visible, wake, walk, where, area, \n
@@ -47,22 +89,107 @@ Information	affects, applicants, areas, changes, commands, compare, consider, cr
 Combat:	cast, channel, chant, commune, confinement, ecast, flee, focus, kill, murder, sing \n
 Misc:	addquest, allow, bet, bug, check, delete, demote, dice, enlist, gain, gamble, gift, grip, group, hammer, heal, induct, outfit, pardon, pay, pet, practice, promote, puke, questor, questor2, quit, raise, refuse, rehearse, release, save, surrender, task, train, uninduct
 </commands>\n
-<tip>
-you can send multiple commands at the same time by separating them each with a pipe | 
-</tip>
+<tips>
+- you can send multiple commands at the same time by separating them each with a pipe | 
+- most characters are NPCs and don't respond to say
+</tips>
 """
-system_prompt = base_system_prompt + "\n\n" + f'<goal>:\n{current_goal}\n</goal>'
 
-def get_ai_response(prompt):
-    # Insert or update system prompt at the top
+def clean_llm_json(content):
+    """
+    Clean and parse LLM output into a Python dict, tolerating
+    single/double quotes and extra/missing braces.
+    """
+    content = content.strip()
+    # Remove code block markers if present
+    content = re.sub(r'^```(?:json)?\n?', '', content)
+    content = re.sub(r'\n?```$', '', content)
+    content = content.strip()
+    # Remove outer single/double quotes if present
+    if (content.startswith("'") and content.endswith("'")) or (content.startswith('"') and content.endswith('"')):
+        content = content[1:-1].strip()
+    # Remove escaped single quotes (from Python stringification)
+    content = content.replace("\\'", "'")
+    # Iteratively strip extra curly braces from the start/end until valid JSON or until no braces left
+    for _ in range(8):  # Up to 8 levels deep, just to be silly robust
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            # Remove extra left curly at start if >1
+            if content.startswith("{{"):
+                content = content[1:].lstrip()
+                continue
+            # Remove extra right curly at end if >1
+            if content.endswith("}}"):
+                content = content[:-1].rstrip()
+                continue
+            # Remove extra left curly at start (unmatched)
+            if content.startswith("{") and not content.endswith("}"):
+                content = content[1:].lstrip()
+                continue
+            # Remove extra right curly at end (unmatched)
+            if content.endswith("}") and not content.startswith("{"):
+                content = content[:-1].rstrip()
+                continue
+            # If still broken, give up
+            break
+    # If we end up here, parsing failed
+    raise
+
+def clean_llm_json(content):
+    content = content.strip()
+    # Remove code block markers if present
+    content = re.sub(r'^```(?:json)?\n?', '', content)
+    content = re.sub(r'\n?```$', '', content)
+    content = content.strip()
+
+    # Remove outer single/double quotes if present
+    if (content.startswith("'") and content.endswith("'")) or \
+       (content.startswith('"') and content.endswith('"')):
+        content = content[1:-1].strip()
+
+    # Remove all leading { and newlines until a single { at the start
+    while content.startswith('{') and content[1] in '{\n':
+        content = content[1:].lstrip('\n')
+    # Remove all trailing } and newlines until a single } at the end
+    while content.endswith('}') and content[-2] in '}\n':
+        content = content[:-1].rstrip('\n')
+
+    # Last-ditch: ensure the content starts and ends with a single curly brace
+    start = content.find('{')
+    end = content.rfind('}')
+    if start != 0 or end != len(content) - 1:
+        content = content[start:end+1]
+
+    # Now parse
+    return json.loads(content)
+
+def get_ai_response(prompt, chat_history, current_goal):
+    # Build the system prompt, adding recent memories
+    recent_memories = get_recent_journal_entries(NUM_MEMORIES)
+    memories_text = ""
+    if recent_memories:
+        memories_text = "Here are your recent journal entries:\n" + "\n".join(f"- {m}" for m in recent_memories) + "\n"
+    system_prompt = (
+        base_system_prompt
+        + "\n\n"
+        + memories_text
+        + f"<goal>:\n{current_goal}\n</goal>\n"
+        + "Remember to keep your 'journal' updated each turn."
+    )
+
+    # Ensure system prompt is always the first message
     if not chat_history or chat_history[0].get('role') != "system":
         chat_history.insert(0, {"role": "system", "content": system_prompt})
+        save_message_to_db({"role": "system", "content": system_prompt})
     else:
         chat_history[0]["content"] = system_prompt
-    # Append user message
-    chat_history.append({"role": "user", "content": prompt})
+        # Update in DB: For simplicity, we leave previous system prompt as-is
 
-    # Write prompt/context to ai_state.json for web UI
+    chat_history.append({"role": "user", "content": prompt})
+    save_message_to_db({"role": "user", "content": prompt})
+
+    # Optionally save context for web UI
     try:
         with open("ai_state.json", "w", encoding="utf-8") as f:
             json.dump({
@@ -73,149 +200,89 @@ def get_ai_response(prompt):
     except Exception as e:
         print(f"[WARN] Could not write ai_state.json: {e}")
 
-    max_retries = 5
-    backoff = 2
-    retries = 0
-    while True:
-        payload = {
-            "messages": chat_history
-        }
-        headers = {
-            "Content-Type": "application/json",
-            # Optionally add Referer and X-Title headers here
-        }
-        if PROVIDER == 'openrouter':
-            # OpenRouter API request
-            payload["model"] = OPENROUTER_MODEL
-            payload["type"] = "json_object"
-            payload["temperature"] = 1.1
-            headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
-        elif PROVIDER == 'ollama':
-            # Ollama API request
-            payload["model"] = "gemma3"
-            payload['format'] = {
-                "type": "object",
-                "properties": {
-                    "reasoning": {
-                        "type": "string"
-                    },
-                    "decision": {
-                        "type": "string"
-                    },
-                    "game_input": {
-                        "type": "string"
-                    }
-                },
-                "required": [
-                    "reasoning",
-                    "decision",
-                    "game_input"
-                ]
-            }
-            payload['options'] = {
-                "temperature": 1.0
-            }
-            payload['stream'] = False
+    payload = {
+        "model": "deepseek-r1:32b", 
+        "messages": chat_history,
+        "format": {
+            "type": "object",
+            "properties": {
+                "journal": {"type": "string"},
+                "reasoning": {"type": "string"},
+                "decision": {"type": "string"},
+                "game_input": {"type": "string"}
+                
+            },
+            "required": ["reasoning", "decision", "game_input", "journal"]
+        },
+        "options": {"temperature": 1.0},
+        "stream": False,
+        "think": True
+    }
 
-        url = OLLAMA_API_URL if PROVIDER == 'ollama' else OPENROUTER_API_URL
-        response = requests.post(
-            url=url,
-            headers=headers,
-            data=json.dumps(payload)
+    headers = {"Content-Type": "application/json"}
+    url = OLLAMA_API_URL
+
+    response = requests.post(
+        url=url,
+        headers=headers,
+        data=json.dumps(payload)
+    )
+    response.raise_for_status()
+    response_text = response.text.strip()
+    try:
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not match:
+            print("[ERROR] No JSON object found in response. Full response:", response_text)
+            raise ValueError("No JSON object found in response.")
+
+        outer = json.loads(match.group(0))
+        inner_content = outer.get("message", {}).get("content", "")
+        content = inner_content.strip()
+        
+        if not content:
+            print("[ERROR] Ollama response content is empty. Full response:", response_text)
+            return None
+
+        parsed = clean_llm_json(content)
+        chat_history.append({"role": "assistant", "content": content})
+        save_message_to_db({"role": "assistant", "content": content})
+
+        # Optionally save AI response for web UI
+        try:
+            with open("ai_state.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "prompt": prompt,
+                    "chat_history": chat_history,
+                    "ai_response": parsed
+                }, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[WARN] Could not write ai_state.json: {e}")
+
+        # Write the journal entry to disk
+        journal_entry = parsed.get('journal', '')
+        append_journal_entry(
+            journal_entry,
+            {
+                "reasoning": parsed.get('reasoning', ''),
+                "decision": parsed.get('decision', ''),
+                "input": parsed.get('game_input', '')
+            }
         )
-        response.raise_for_status()
 
-        response_text = response.text.strip()
+        return parsed
 
-        # Try to parse as JSON and check for 429/quota error
-        is_quota_error = False
-        try:
-            resp_json = json.loads(response_text)
-            if 'error' in resp_json:
-                err = resp_json['error']
-                code = err.get('code')
-                status = err.get('status', '')
-                if code == 429 or status == 'RESOURCE_EXHAUSTED':
-                    is_quota_error = True
-                # Some providers (like Google) may wrap the real error in metadata['raw']
-                if 'metadata' in err and 'raw' in err['metadata']:
-                    try:
-                        raw_err = json.loads(err['metadata']['raw'])
-                        raw_code = raw_err.get('error', {}).get('code')
-                        raw_status = raw_err.get('error', {}).get('status', '')
-                        if raw_code == 429 or raw_status == 'RESOURCE_EXHAUSTED':
-                            is_quota_error = True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        if is_quota_error:
-            if retries < max_retries:
-                print(f"[ERROR] Quota exceeded or rate limited (429). Retrying in {backoff} seconds...")
-                time.sleep(backoff)
-                retries += 1
-                backoff *= 2
-                continue
-            else:
-                print("[ERROR] Maximum retries reached. Please check your API quota or try again later.")
-                return None
+    except json.JSONDecodeError as e:
+        print("JSON decode error:", e)
+        raise
 
-        try:
-            match = re.search(r'\{.*\}', response_text, re.DOTALL)
-            if not match:
-                raise ValueError("No JSON object found in response.")
-            
-            outer = json.loads(match.group(0))  # Step 1: parse outer object
-            
-            if PROVIDER == 'ollama':
-                # Step 2: parse stringified JSON in content
-                inner_content = outer.get("message", {}).get("content", "")
-                content = inner_content.strip()
-                # Remove markdown code block if present
-                if content.startswith('```'):
-                    lines = content.splitlines()
-                    # Remove first and last line (code block markers)
-                    if lines[0].startswith('```') and lines[-1].startswith('```'):
-                        content = '\n'.join(lines[1:-1]).strip()
-                parsed = json.loads(content)  # Step 3: final object
-            else:
-                # OpenRouter path
-                content = outer.get('choices', [{}])[0].get('message', {}).get('content', '').strip()
-                # Remove markdown code block if present
-                if content.startswith('```'):
-                    lines = content.splitlines()
-                    # Remove first and last line (code block markers)
-                    if lines[0].startswith('```') and lines[-1].startswith('```'):
-                        content = '\n'.join(lines[1:-1]).strip()
-                parsed = json.loads(content)
-
-            chat_history.append({"role": "assistant", "content": content})
-            # Write AI response to ai_state.json for web UI
-            try:
-                with open("ai_state.json", "w", encoding="utf-8") as f:
-                    json.dump({
-                        "prompt": prompt,
-                        "chat_history": chat_history,
-                        "ai_response": parsed
-                    }, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[WARN] Could not write ai_state.json: {e}")
-            return parsed  # Already parsed dict
-
-        except json.JSONDecodeError as e:
-            print("JSON decode error:", e)
-            raise
-
-def send_command_and_get_response(tn, command):
-    tn.write(command.encode('utf-8') + b'\n')
-    response = tn.read_until(b'>> ', timeout=5)
-    return response.decode('utf-8', errors='ignore')
-
+# ------------------- MAIN GAME LOOP -------------------
 def main():
-    global last_stats_check, waiting_for_stats
     tn = None
     log_file = None
     try:
+        chat_history = load_chat_history_from_db()
+        current_goal = load_current_goal()
+
         tn = telnetlib.Telnet(MUD_HOST, MUD_PORT)
         print(f"Connected to {MUD_HOST}:{MUD_PORT}")
 
@@ -228,8 +295,7 @@ def main():
             'MUD_HOST': MUD_HOST,
             'MUD_PORT': MUD_PORT,
             'USERNAME': USERNAME,
-            'OPENROUTER_MODEL': OPENROUTER_MODEL,
-            'PROVIDER': PROVIDER
+            'SESSION_ID': SESSION_ID
         }
         log_file.write("# Environment variables (non-secret):\n")
         for k, v in env_vars_to_log.items():
@@ -238,25 +304,23 @@ def main():
         log_file.flush()
 
         buffer_window = []
-        logged_in = False  # Add this flag
+        logged_in = False
         one_time_score_sent = False
         while True:
             # Send 'score' once after login when first prompt appears
             if not logged_in and not one_time_score_sent:
                 tn.write(b'score\n')
                 one_time_score_sent = True
-                time.sleep(1)  # Wait for a moment to let the score be processed
+                time.sleep(1)
             data = tn.read_very_eager().decode('utf-8', errors='ignore')
-            # data = tn.read_until(b'> ', timeout=5).decode('utf-8', errors='ignore')
-            
+
             # Auto-continue if prompt is present
             if '[Hit Return to continue]' in data:
                 tn.write(b'\n')
                 continue
-            
+
             if data:
                 print(data, end='')
-                # hard coding login for abandonedrealms.com
                 if 'By what name do you wish to be known' in data or 'By what name do you wish to be remembered' in data:
                     tn.write(USERNAME.encode('utf-8') + b'\n')
                     print(f"Sending username: {USERNAME}\n")
@@ -266,38 +330,36 @@ def main():
                     print(f"Sending password: ***\n")
                     logged_in = True
                     continue
-                # if 'That character is already playing.' in data:
-                #     tn.write(b'y\n')
-                #     continue
-                
 
                 log_file.write(data)
-                log_file.flush()       
+                log_file.flush()
                 buffer_window.append(data)
                 if len(buffer_window) > 1:
                     buffer_window.pop(0)
                 context = ''.join(buffer_window)
                 if '>>' in data:
-                    parsed = get_ai_response(context)
+                    parsed = get_ai_response(context, chat_history, current_goal)
                     if parsed is None:
-                        print("[INFO] AI response unavailable due to quota/rate limit. Press Enter to retry or Ctrl+C to exit.")
+                        print("[INFO] AI response unavailable. Press Enter to retry or Ctrl+C to exit.")
                         input()
                         continue
                     reasoning = parsed.get('reasoning', '')
                     decision = parsed.get('decision', '')
                     game_input = parsed.get('game_input', '')
+                    journal = parsed.get('journal', '')
                     print(f"\n\033[35m[AI reasoning]: {reasoning}\033[0m")
                     print(f"\033[32m[AI decision]: {decision}\033[0m")
                     print(f"\033[36m[AI input]: {game_input}\033[0m")
+                    print(f"\033[34m[AI journal]: {journal}\033[0m")
                     log_file.write(f"AI reasoning: {reasoning}\n")
                     log_file.write(f"AI input: {game_input}\n")
+                    log_file.write(f"AI journal: {journal}\n")
                     log_file.flush()
                     tn.write(((game_input if game_input else '') + '\n').encode('utf-8'))
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nGraceful shutdown requested. Closing connections...")
     finally:
-        # On shutdown, try to send 'score' and log the output
         if tn and log_file:
             try:
                 tn.write(b'score\n')
