@@ -91,14 +91,14 @@ Misc:	addquest, allow, bet, bug, check, delete, demote, dice, enlist, gain, gamb
 </commands>\n
 <tips>
 - you can send multiple commands at the same time by separating them each with a pipe | 
-- most characters are NPCs and don't respond to say
+- most characters are NPCs and don't respond to "say" or "tell" only specific commands such as "list" to see what they offer
 </tips>
 """
 
 def clean_llm_json(content):
     """
     Clean and parse LLM output into a Python dict, tolerating
-    single/double quotes and extra/missing braces.
+    single/double quotes and extra/missing braces, even with whitespace between braces.
     """
     content = content.strip()
     # Remove code block markers if present
@@ -110,59 +110,45 @@ def clean_llm_json(content):
         content = content[1:-1].strip()
     # Remove escaped single quotes (from Python stringification)
     content = content.replace("\\'", "'")
-    # Iteratively strip extra curly braces from the start/end until valid JSON or until no braces left
-    for _ in range(8):  # Up to 8 levels deep, just to be silly robust
+    # Iteratively strip extra curly braces (with optional whitespace) from the start/end until valid JSON or until no braces left
+    for _ in range(8):
         try:
             return json.loads(content)
-        except json.JSONDecodeError as e:
-            # Remove extra left curly at start if >1
-            if content.startswith("{{"):
-                content = content[1:].lstrip()
-                continue
-            # Remove extra right curly at end if >1
-            if content.endswith("}}"):
-                content = content[:-1].rstrip()
-                continue
+        except json.JSONDecodeError:
+            # Remove all extra left curly at start (with whitespace)
+            new_content = re.sub(r'^(\s*\{\s*){2,}', '{', content)
+            if new_content != content:
+                content = new_content
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    pass
+            # Remove all extra right curly at end (with whitespace)
+            new_content = re.sub(r'(\s*\}\s*){2,}$', '}', content)
+            if new_content != content:
+                content = new_content
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    pass
             # Remove extra left curly at start (unmatched)
-            if content.startswith("{") and not content.endswith("}"):
-                content = content[1:].lstrip()
-                continue
+            if content.startswith("{") and not content.rstrip().endswith("}"):
+                content = re.sub(r'^\s*\{\s*', '', content)
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    continue
             # Remove extra right curly at end (unmatched)
-            if content.endswith("}") and not content.startswith("{"):
-                content = content[:-1].rstrip()
-                continue
-            # If still broken, give up
+            if content.rstrip().endswith("}") and not content.lstrip().startswith("{"):
+                content = re.sub(r'\s*\}\s*$', '', content)
+                try:
+                    return json.loads(content)
+                except json.JSONDecodeError:
+                    continue
             break
     # If we end up here, parsing failed
     raise
 
-def clean_llm_json(content):
-    content = content.strip()
-    # Remove code block markers if present
-    content = re.sub(r'^```(?:json)?\n?', '', content)
-    content = re.sub(r'\n?```$', '', content)
-    content = content.strip()
-
-    # Remove outer single/double quotes if present
-    if (content.startswith("'") and content.endswith("'")) or \
-       (content.startswith('"') and content.endswith('"')):
-        content = content[1:-1].strip()
-
-    # Remove all leading { and newlines until a single { at the start
-    while content.startswith('{') and content[1] in '{\n':
-        content = content[1:].lstrip('\n')
-    # Remove all trailing } and newlines until a single } at the end
-    while content.endswith('}') and content[-2] in '}\n':
-        content = content[:-1].rstrip('\n')
-
-    # Last-ditch: ensure the content starts and ends with a single curly brace
-    start = content.find('{')
-    end = content.rfind('}')
-    if start != 0 or end != len(content) - 1:
-        content = content[start:end+1]
-
-    # Now parse
-    return json.loads(content)
 
 def get_ai_response(prompt, chat_history, current_goal):
     # Build the system prompt, adding recent memories
